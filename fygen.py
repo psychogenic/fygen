@@ -212,6 +212,7 @@ class FYGen(object):
       self,
       serial_path='/dev/ttyUSB0',
       port=None,
+      baudrate=115200,
       device_name=None,
       default_channel=0,
       read_before_write=True,
@@ -221,6 +222,9 @@ class FYGen(object):
       max_volts=20.0,
       min_volts=-20.0,
       _port_is_serial=False,
+      # unterminated_responses for cases like fy2320 v3.4 that aren't
+      # suffixes responses with a return char
+      unterminated_responses=False, 
   ):
     """Initializes connection to device.
 
@@ -248,6 +252,9 @@ class FYGen(object):
       max_volts: Maximum volts/offset to allow
       min_volts: Minimum voltage offset to allow
     """
+    
+    self.unterminated_responses = unterminated_responses
+    self.port_timeout = timeout
     if port:
       self.port = port
       self.is_serial = _port_is_serial
@@ -259,7 +266,7 @@ class FYGen(object):
     else:
       self.port = serial.Serial(
           port=serial_path,
-          baudrate=115200,
+          baudrate=baudrate,
           bytesize=serial.EIGHTBITS,
           parity=serial.PARITY_NONE,
           stopbits=serial.STOPBITS_ONE,
@@ -282,18 +289,22 @@ class FYGen(object):
     self.min_volts = min_volts
     # Set to force sweep enable
     self.force_sweep_enable = False
-
+    
+    self.device_model = None
     # Detect model
     if self.device_name is None:
-      model = self.get_model()
-      self.device_name = detect_device(model)
+      self.device_model = self.get_model()
+      self.device_name = detect_device(self.device_model)
 
   def close(self):
     """Closes serial port.  Call this at program exit for a clean shutdown."""
     self.port.close()
     self.port = None
 
-  def send(self, command, retry_count=5):
+  def send_and_receive(self, command, retries=5):
+    return self.send(command, retry_count=retries, get_response=True)
+
+  def send(self, command, retry_count=5, get_response=False):
     """Sends command, then waits for a response.  Returns the response."""
     if len(command) < 3:
       raise CommandTooShortError('Command too short: %s' % command)
@@ -302,6 +313,10 @@ class FYGen(object):
       six.moves.input('%s (Press Enter to Send)' % command)
 
     data = command + '\n'
+    
+    if self.debug_level > 1:
+      sys.stdout.write('SENDING: %s\n' % command)
+    
     if self.is_serial:
       data = data.encode()
       self.port.reset_output_buffer()
@@ -309,14 +324,17 @@ class FYGen(object):
 
     self.port.write(data)
     self.port.flush()
-
+    
+    if not get_response:
+      return ''
+    
     response = self._recv(command)
 
     if self.is_serial and not response and retry_count > 0:
       # sometime the siggen answers queries with nothing.  Wait a bit and try
       # again
       time.sleep(0.1)
-      return self.send(command, retry_count - 1)
+      return self.send_and_receive(command, retry_count - 1)
 
     return response.strip()
 
@@ -491,6 +509,10 @@ class FYGen(object):
         used.
       params: See above
     """
+    
+    
+    if self.debug_level:
+      sys.stdout.write('GET: on %s\n\t%s\n' % (str(channel), str(params)))
 
     if channel is None:
       channel = self.default_channel
@@ -515,20 +537,20 @@ class FYGen(object):
 
     prefix = 'RF' if channel == 1 else 'RM'
 
-    def send(code):
+    def send_rcv(code):
       """self.send shortcut."""
-      return self.send(prefix + code)
+      return self.send_and_receive(prefix + code)
 
     def get_waveform_name():
       """Gets the waveform name from the signal generator."""
       try:
-        return wavedef.get_name(self.device_name, int(send('W')), channel)
+        return wavedef.get_name(self.device_name, int(send_rcv('W')), channel)
       except wavedef.Error:
         raise UnknownWaveformError('Unknown waveform index returned')
 
     def get_offset_volts():
       """Gets offset volts, correcting for an "unsigned" bug in the fygen."""
-      offset_unsigned = int(send('O'))
+      offset_unsigned = int(send_rcv('O'))
       if offset_unsigned > 0x80000000:
         offset_unsigned = -(0x100000000 - offset_unsigned)
       return float(offset_unsigned) / 1000
@@ -537,13 +559,13 @@ class FYGen(object):
 
     # mapping of parameters to conversion functions.
     conversions = {
-        'duty_cycle': lambda: float(send('D')) / 100000.0,
-        'enable': lambda: bool(int(send('N'))),
-        'freq_hz': lambda: int(send('F').split('.')[0]),
-        'freq_uhz': lambda: int(float(send('F')) * 1000000.0),
+        'duty_cycle': lambda: float(send_rcv('D')) / 100000.0,
+        'enable': lambda: bool(int(send_rcv('N'))),
+        'freq_hz': lambda: int(send_rcv('F').split('.')[0]),
+        'freq_uhz': lambda: int(float(send_rcv('F')) * 1000000.0),
         'offset_volts': get_offset_volts,
-        'phase_degrees': lambda: float(send('P')) / 1000.0,
-        'volts': lambda: float(send('A')) / 10000.0,
+        'phase_degrees': lambda: float(send_rcv('P')) / 1000.0,
+        'volts': lambda: float(send_rcv('A')) / 10000.0,
         'wave': get_waveform_name,
     }
 
@@ -626,7 +648,7 @@ class FYGen(object):
       data.append(v & 255)  # lower 8 bits
       data.append((v >> 8) & 63)  # upper 6 bits
 
-    response = self.send('DDS_WAVE%u' % waveform_index)
+    response = self.send_and_receive('DDS_WAVE%u' % waveform_index)
     if self.is_serial and response != 'W':
       raise CommandNotAcknowledgedError('DDS_WAVE command was not acknowledged')
 
@@ -1003,20 +1025,20 @@ class FYGen(object):
     def read_frequency():
       """Reads the current measurement frequency."""
       try:
-        gate_time = int(self.send('RCG'))
+        gate_time = int(self.send_and_receive('RCG'))
       except ValueError:
         raise InvalidGateTimeError('RCG returned an unrecognized gate time.')
-      return float(self.send('RCF')) / (10.0 ** gate_time)
+      return float(self.send_and_receive('RCF')) / (10.0 ** gate_time)
 
     getters = {
         'freq_hz': read_frequency,
-        'counter': lambda: int(self.send('RCC')),
-        'period_sec': lambda: float(self.send('RCT')) / 1000000000.0,
+        'counter': lambda: int(self.send_and_receive('RCC')),
+        'period_sec': lambda: float(self.send_and_receive('RCT')) / 1000000000.0,
         'positive_width_sec': lambda: float(
-            self.send('RC+')) / 1000000000.0,
+            self.send_and_receive('RC+')) / 1000000000.0,
         'negative_width_sec': lambda: float(
-            self.send('RC-')) / 1000000000.0,
-        'duty_cycle': lambda: float(self.send('RCD')) / 1000.0,
+            self.send_and_receive('RC-')) / 1000000000.0,
+        'duty_cycle': lambda: float(self.send_and_receive('RCD')) / 1000.0,
     }
 
     results = {}
@@ -1092,7 +1114,7 @@ class FYGen(object):
       if p not in SYNC_MODES:
         raise InvalidSynchronizationMode(
             'Invalid synchronization mode: %s' % p)
-      data[p] = bool(int(self.send('RSA%u' % SYNC_MODES[p])))
+      data[p] = bool(int(self.send_and_receive('RSA%u' % SYNC_MODES[p])))
 
     if isinstance(params, str):
       return data[params]
@@ -1105,7 +1127,7 @@ class FYGen(object):
 
   def get_buzzer(self):
     """Returns True if the buzzer is enabled."""
-    return bool(int(self.send('RBZ')))
+    return bool(int(self.send_and_receive('RBZ')))
 
   def set_uplink(self, is_master=None, enable=None):
     """Sets uplink mode as master or slave.
@@ -1144,9 +1166,9 @@ class FYGen(object):
     results = {}
     for parm in params:
       if parm == 'enable':
-        results[parm] = bool(int(self.send('RUL')))
+        results[parm] = bool(int(self.send_and_receive('RUL')))
       elif parm == 'is_master':
-        results[parm] = not bool(int(self.send('RMS')))
+        results[parm] = not bool(int(self.send_and_receive('RMS')))
       else:
         raise UnknownParameterError('Unknown uplink parameter: %s' % parm)
 
@@ -1157,17 +1179,53 @@ class FYGen(object):
 
   def get_id(self):
     """Returns the device id."""
-    return self.send('UID')
+    return self.send_and_receive('UID')
 
   def get_model(self):
     """Returns the device model."""
-    return self.send('UMO')
+    return self.send_and_receive('UMO')
 
   def _recv(self, command):
     """Waits for device."""
     if not self.is_serial:
       return ''
-    response = self.port.read_until(size=MAX_READ_SIZE).decode('utf8')
+    
+    rcvDelay = 0.1
+    if self.unterminated_responses:
+      time.sleep(rcvDelay)
+      response = bytes()
+      foundTerminator = False
+      tTimeoutSecs = time.time() + self.port_timeout
+      attemptCount = 0
+      while not foundTerminator:
+        if attemptCount >= 3:
+          break
+        if time.time() >= tTimeoutSecs:
+          sys.stdout.write('unterminated read timeout\n')
+          break
+        if not self.port.in_waiting:
+          if len(response):
+            # already have collected some info, counts as an attempt
+            attemptCount += 1
+          time.sleep(rcvDelay)
+          continue
+        
+        while self.port.in_waiting:
+          c = self.port.read(size=1)
+          #sys.stdout.write("R '%s'" % str(c))
+          if c.decode('utf8') == '\n':
+            #sys.stdout.write('tertminator!!\n')
+            foundTerminator = True
+          else:
+            response += c    
+          if not self.port.in_waiting:
+            time.sleep(rcvDelay)
+            
+      
+      if len(response):
+          response = response.decode('utf8')     
+    else:
+      response = self.port.read_until(size=MAX_READ_SIZE).decode('utf8')
     if self.debug_level:
       sys.stdout.write('%s -> %s\n' % (command.strip(), response.strip()))
     return response

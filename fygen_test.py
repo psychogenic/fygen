@@ -101,8 +101,8 @@ class TestFYGen(unittest.TestCase):
     fs = FakeSerial([b'foo\n', b'bar\n'])
     fy = fygen.FYGen(port=fs)
     fy.is_serial = True
-    self.assertEqual('foo', fy.send('foocmd'))
-    self.assertEqual('bar', fy.send('barcmd'))
+    self.assertEqual('foo', fy.send_and_receive('foocmd'))
+    self.assertEqual('bar', fy.send_and_receive('barcmd'))
     self.assertEqual('foocmd\nbarcmd\n', fs.getvalue())
 
   def test_send_too_short(self):
