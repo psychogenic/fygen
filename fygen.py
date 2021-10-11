@@ -225,6 +225,7 @@ class FYGen(object):
       # unterminated_responses for cases like fy2320 v3.4 that aren't
       # suffixes responses with a return char
       unterminated_responses=False, 
+      intersend_spacing_s=0.2
   ):
     """Initializes connection to device.
 
@@ -252,7 +253,7 @@ class FYGen(object):
       max_volts: Maximum volts/offset to allow
       min_volts: Minimum voltage offset to allow
     """
-    
+    self.intersend_spacing_s = intersend_spacing_s
     self.unterminated_responses = unterminated_responses
     self.port_timeout = timeout
     if port:
@@ -324,6 +325,8 @@ class FYGen(object):
 
     self.port.write(data)
     self.port.flush()
+    if not self.read_before_write:
+        time.sleep(self.intersend_spacing_s)
     
     if not get_response:
       return ''
@@ -511,7 +514,7 @@ class FYGen(object):
     """
     
     
-    if self.debug_level:
+    if self.debug_level > 1:
       sys.stdout.write('GET: on %s\n\t%s\n' % (str(channel), str(params)))
 
     if channel is None:
@@ -927,6 +930,7 @@ class FYGen(object):
 
     for command in commands:
       self.send(command)
+      time.sleep(self.intersend_spacing_s)
 
     # -- This should come last ---
     if enable is not None and enable:
@@ -1190,7 +1194,7 @@ class FYGen(object):
     if not self.is_serial:
       return ''
     
-    rcvDelay = 0.1
+    rcvDelay = self.intersend_spacing_s/2.0
     if self.unterminated_responses:
       time.sleep(rcvDelay)
       response = bytes()
