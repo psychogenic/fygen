@@ -78,7 +78,7 @@ SET_INIT_STATE = {
     'freq_hz': 10000,
     'offset_volts': 0,
     'phase_degrees': 0,
-    'volts': 5,
+    'volts': 1.5, # safer default
     'wave': 'sin',
 }
 
